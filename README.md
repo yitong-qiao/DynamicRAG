@@ -22,4 +22,5 @@ bash run_selfRAG.sh \
 使用模型：meta/Llama-3-8B-Instruct, 因为原来的etc github仓库中只提供了该模型的默认配置参数 \
 bash run_etc.sh \ 
 生成样例：etc_resuls/halueval_etc_results.jsonl and truthfulqa_etc_results.jsonl \
-最终答案从<answer></answer>标签中提取
+最终答案从<answer></answer>标签中提取 \
+注： 对于halueval数据集将max_length设置为128已经足够； 对于truthfulqa则需要设置稍微长一些，如512
