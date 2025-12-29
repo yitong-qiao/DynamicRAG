@@ -15,7 +15,7 @@ import os
 import pandas as pd
 from tqdm import tqdm
 from openai import OpenAI
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -561,10 +561,6 @@ class BasicGeneratorRIND:
 
 
 
-
-
-
-
 # ==========================================
 # DRAGIN 核心组件: QFS (Query Formulation based on Self-attention)
 # ==========================================
@@ -689,6 +685,7 @@ class SentenceStopper(transformers.StoppingCriteria):
         if input_ids.shape[1] > 0:
             return input_ids[0, -1].item() in self.stop_token_ids
         return False
+    
 def get_next_sentence_with_scores(model, tokenizer, input_ids, device, max_new_tokens=128):
     stopper = SentenceStopper(tokenizer)
     stopping_criteria = transformers.StoppingCriteriaList([stopper])
@@ -775,29 +772,33 @@ def process_single_question_dragin(question, model, tokenizer, rind_calculator, 
     # --- 参数设置 ---
     RIND_THRESHOLD = 1.2  
     TOP_N_TOKENS = 35     
-    MAX_NEW_TOKENS = 1024 # 和原来的代码保持一致
+    MAX_NEW_TOKENS = 1024
     
     # Prompt 构造
     base_prompt = f"{HOTPOT_QA_EXEMPLARS}\n\nAnswer the following question by reasoning step-by-step, following the example above. First provide your reasoning. Then provide the final direct answer enclosed inside <answer> and </answer>. After providing the final answer, end your response.\nQuestion: {question}\nAnswer:"
     
-    # base_prompt = f"""Answer the given question. First provide your reasoning. Then provide the final direct answer enclosed inside <answer> and </answer>, without detailed illustrations. After providing the final answer, end your response and do not output anything else.\n{HOTPOT_QA_EXEMPLARS}\nQuestion: {question}\nAnswer:"""
-
     current_context = base_prompt
     generated_text_so_far = "" 
     
     collected_sentences = []
     collected_scores = []
+    collected_contexts = [] # 收集检索上下文
     full_process_log = base_prompt
+
+    # 【修改点 1】Buffer 升级：分开存储 Token IDs (用于还原文本) 和 RIND Scores (用于打分)
+    current_buffer_ids = []      # 存储 token id (int)
+    current_buffer_scores = []   # 存储 (word_str, score_float) 用于后续对齐
+
+    # 记录最近一次的检索内容
+    last_retrieved_context = "No external context used."
     
-    # 句子缓冲
-    current_sentence_buffer = ""
+    # 标记是否已经遇到 answer 标签
+    answer_tag_encountered = False
 
     step = 0
-    # 强制停止：防止死循环导致 OOM (设置一个合理的步数上限，比如 50 步)
     max_steps = 50 
     
     while len(tokenizer.encode(generated_text_so_far)) < MAX_NEW_TOKENS and step < max_steps:
-        print(f"DEBUG: Current Len: {len(tokenizer.encode(generated_text_so_far))}") 
         step += 1
         
         input_ids = tokenizer.encode(current_context, return_tensors='pt').to(device)
@@ -808,9 +809,8 @@ def process_single_question_dragin(question, model, tokenizer, rind_calculator, 
         if len(temp_seq) == 0:
             break
         
-        # 当前临时生成的句子文本
-        temp_text = tokenizer.decode(temp_seq, skip_special_tokens=True)
-        # print(f"DEBUG: Temp Text: {temp_text}")
+        # 临时解码用于 Trigger 检测（依然需要）
+        # temp_text = tokenizer.decode(temp_seq, skip_special_tokens=True) 
         
         # 计算 RIND
         class MiniOut:
@@ -818,16 +818,13 @@ def process_single_question_dragin(question, model, tokenizer, rind_calculator, 
         mini_out = MiniOut(temp_scores)
         full_temp_input_ids = torch.cat([input_ids, temp_seq.unsqueeze(0)], dim=1)
         rind_list = rind_calculator.compute_rind_for_generation(mini_out, temp_seq, full_temp_input_ids, solver='max')
-        # rind_list = rind_calculator.compute_rind_for_generation(mini_out, temp_seq, solver='max')
         
         trigger_info = None
         current_token_offset = 0 
-        max_score_in_sent = 0.0
         
+        # 检测 Trigger
         for idx, item in enumerate(rind_list):
             word, score, _, _, _, _ = item
-            max_score_in_sent = max(max_score_in_sent, score)
-            
             word_tokens_len = len(tokenizer.encode(word, add_special_tokens=False))
             
             if score > RIND_THRESHOLD:
@@ -835,33 +832,38 @@ def process_single_question_dragin(question, model, tokenizer, rind_calculator, 
                     "word": word,
                     "score": score,
                     "token_start_idx": current_token_offset, 
-                    "word_len": word_tokens_len
+                    "word_len": word_tokens_len,
+                    "rind_index": idx # 记录在 rind_list 中的索引
                 }
                 break 
-            
             current_token_offset += word_tokens_len
             
-        if trigger_info:
-            # 如果触发位置是 0 (句首)，说明这句话第一个词就有问题。
-            # 如果我们截断，就等于什么都没生成。下一轮还是从这里开始，还是这个词，还是触发。
-            # 解决方案：如果是句首触发，强制忽略，让模型先把这句话生成完。
-            if trigger_info['token_start_idx'] == 0:
-                # print(f"DEBUG: Trigger at start of sentence ('{trigger_info['word']}'). Skipping retrieval to enforce progress.")
-                trigger_info = None
+        if trigger_info and trigger_info['token_start_idx'] == 0:
+            trigger_info = None # 句首触发强制忽略
         
-        # === 触发检索 ===
+        # === 分支 A: 触发检索 ===
         if trigger_info:
-            trigger_start = trigger_info['token_start_idx']
-            trigger_end = trigger_start + trigger_info['word_len']
+            # 1. 切分 IDs
+            trigger_start_token_idx = trigger_info['token_start_idx']
+            text_before_ids = temp_seq[:trigger_start_token_idx] # Tensor
+            text_before_trigger_str = tokenizer.decode(text_before_ids, skip_special_tokens=True)
             
-            text_before_ids = temp_seq[:trigger_start]
-            trigger_ids = temp_seq[trigger_start:trigger_end]
-            text_before_trigger = tokenizer.decode(text_before_ids, skip_special_tokens=True)
+            # 2. 存入 Buffer (Token IDs 和 Scores)
+            # IDs: 只需要 trigger 之前的部分
+            current_buffer_ids.extend(text_before_ids.tolist())
             
-            # 缓存
-            current_sentence_buffer += text_before_trigger
+            # Scores: 从 rind_list 中截取 trigger 之前的部分
+            # 注意：这里需要截取到 trigger_info['rind_index']
+            stop_rind_idx = trigger_info['rind_index']
+            for i in range(stop_rind_idx):
+                w, s, _, _, _, _ = rind_list[i]
+                current_buffer_scores.append((w, s))
 
-            # QFS Input
+            # 3. 执行检索
+            trigger_end = trigger_start_token_idx + trigger_info['word_len']
+            trigger_ids = temp_seq[trigger_start_token_idx:trigger_end]
+            
+            # QFS Input 构造
             t_before = text_before_ids.unsqueeze(0).to(device) if text_before_ids.dim() == 1 else text_before_ids.to(device)
             t_trigger = trigger_ids.unsqueeze(0).to(device) if trigger_ids.dim() == 1 else trigger_ids.to(device)
             if t_before.numel() == 0:
@@ -873,71 +875,138 @@ def process_single_question_dragin(question, model, tokenizer, rind_calculator, 
             query = formulate_query_qfs(model, tokenizer, qfs_input_ids, trigger_idx_in_full, top_n=TOP_N_TOKENS)
             docs_list = search_dragin(query)
             
-            # 1. 更新总生成文本
-            generated_text_so_far += text_before_trigger
+            generated_text_so_far += text_before_trigger_str
             
-            # 2. 构造检索文档块
-            context_block = "\nBelow are the external knowledge references:\n"
-            for doc in docs_list:
-                context_block += f"{doc}\n"
-            
-            # 3. 重构 Prompt：Exemplars + 新知识 + 原始问题 + 目前已生成的答案
-            # 这样避免了重复堆叠 instruction，逻辑更清晰
+            # 记录完整过程日志
+            full_process_log += text_before_trigger_str
+
+            # 4. 更新 Context (格式化处理)
+            # 【修改点 2】Context 清洗，移除换行，方便定位
+            if docs_list:
+                cleaned_docs = [d.replace("\n", " ") for d in docs_list]
+                # 记录为 "[1]... [2]..." 的形式
+                last_retrieved_context = " ".join(cleaned_docs)
+                context_block = "\nBelow are the external knowledge references:\n" + "\n".join(docs_list)
+            else:
+                context_block = "" # 搜索失败不更新 context_block，保持 last_retrieved_context 不变或怎样？
+                                   # 通常应该保留上一次有效的，或者更新为 "Search returned nothing"
+
+            # 5. 更新 Prompt
             new_prompt = f"{HOTPOT_QA_EXEMPLARS}\n{context_block}\n"
             new_prompt += f"Answer the following question by reasoning step-by-step based on the external knowledge. First provide your reasoning. Then provide the final direct answer enclosed inside <answer> and </answer>. After providing the final answer, end your response.\nQuestion: {question}\nAnswer: {generated_text_so_far}"
-
             current_context = new_prompt
-            
-            # 记录日志
-            # full_process_log += text_before_trigger
-            # full_process_log += f"\n[RIND Trigger: '{trigger_info['word']}' -> Search: '{query}']\n"
 
+        # === 分支 B: 未触发 (本轮生成结束) ===
         else:
-            # === 未触发 或 强制跳过 ===
-            # 拼接缓冲区内容和当前生成的句子，形成完整句子
-            full_valid_sentence = current_sentence_buffer + temp_text
-            # 存入结果列表 (记录的是真正被采纳的完整句子)
-            collected_sentences.append(full_valid_sentence.strip())
-            print("full_valid_sentence.strip():", full_valid_sentence.strip())
-            collected_scores.append(round(max_score_in_sent, 4))
-            # 记录完整句子
-            full_process_log += full_valid_sentence
-            # 清空缓冲区 (因为句子已经结束并记录了)
-            current_sentence_buffer = ""
+            # 1. 存入 Buffer (全部)
+            current_buffer_ids.extend(temp_seq.tolist())
+            for item in rind_list:
+                w, s, _, _, _, _ = item
+                current_buffer_scores.append((w, s))
+            
+            # 2. 【核心修改】使用 Token IDs 还原文本 (解决空格/乱码问题)
+            # 这样 Spacy 拿到的就是正常的 "The cat is..." 而不是 "Thecatis..."
+            full_text_proper = tokenizer.decode(current_buffer_ids, skip_special_tokens=True)
+            
+            # 3. Spacy 分句
+            doc = rind_calculator.nlp(full_text_proper)
+            
+            # 4. 对齐分数 (难点：full_text_proper 有空格，buffer_scores 里的 word 无空格)
+            # 策略：使用“去空格后的字符长度”作为游标进行对齐
+            score_cursor = 0
+            
+            for span in doc.sents:
+                sent_text = span.text.strip()
+                if not sent_text:
+                    continue
+                
+                # Answer 截断检测
+                if "<answer>" in sent_text.lower():
+                    answer_tag_encountered = True
+                if answer_tag_encountered and "<answer>" not in sent_text.lower():
+                     continue # 跳过后续句子
+
+                # --- 对齐逻辑开始 ---
+                # 计算当前句子实质长度 (去空格)
+                sent_pure_len = len(sent_text.replace(" ", "").replace("\n", ""))
+                current_sent_scores_list = []
+                acc_len = 0
+                
+                # 从 score_cursor 开始消费 buffer_scores，直到填满句子长度
+                temp_cursor = score_cursor
+                while temp_cursor < len(current_buffer_scores):
+                    w, s = current_buffer_scores[temp_cursor]
+                    # RIND word 通常已经去掉了 tokenizer 的 space token，但为了保险再 clean 一次
+                    w_clean = w.replace(rind_calculator.space_token, "").replace(" ", "").replace("\n", "")
+                    
+                    current_sent_scores_list.append(s)
+                    acc_len += len(w_clean)
+                    temp_cursor += 1
+                    
+                    # 如果累计长度 >= 句子长度，说明当前单词跨越了句号或刚好结束
+                    if acc_len >= sent_pure_len:
+                        break
+                
+                score_cursor = temp_cursor # 更新游标
+                # --- 对齐逻辑结束 ---
+                
+                max_s = max(current_sent_scores_list) if current_sent_scores_list else 0.0
+
+                # 5. 存入结果
+                collected_sentences.append(sent_text)
+                collected_scores.append(round(max_s, 4))
+                
+                # 【修改点 3】存入清洗后的 Context，方便定位
+                # 确保 context 不含换行符，且与句子 1:1 对应
+                safe_context = last_retrieved_context.replace("\n", " ").replace("\r", "")
+                collected_contexts.append(safe_context)
+
+                # 检查是否结束
+                if "</answer>" in sent_text.lower():
+                    answer_tag_encountered = True 
+
+            # 清空 Buffer
+            current_buffer_ids = []
+            current_buffer_scores = []
+            
+            # 更新 Context 和 Text
+            temp_text = tokenizer.decode(temp_seq, skip_special_tokens=True)
+            # 记录完整过程日志
+            full_process_log += temp_text
 
             generated_text_so_far += temp_text
             current_context += temp_text
 
             if tokenizer.eos_token_id in temp_seq:
                 break
-            if "</answer>" in full_valid_sentence.lower(): 
+            if answer_tag_encountered:
                 break
             
-        
-    
-    # ★ FIX: 循环结束后，如果缓冲区里还有没拼完的半句话，也需要存下来
-    # if current_sentence_buffer:
-    #     full_valid_sentence = current_sentence_buffer
-    #     collected_sentences.append(full_valid_sentence.strip())
-    #     # 对于残句，分数可以给 0 或者最后一次的分数，这里给 0 标记
-    #     collected_scores.append(0.0)
-
-    # Filter 逻辑部分
+    # --- Filter 逻辑 ---
+    # 格式化列表为字符串，用于 CSV 存储或 API 调用
+    # 使用自定义的 format_list_custom 确保 [x][y] 格式
     raw_sents_str = format_list_custom(collected_sentences)
     raw_scores_str = format_list_custom(collected_scores)
     
-    # try:
-    #     filtered_sents_list, filtered_scores_list, _ = filter_judge.judge_sentence(raw_sents_str, raw_scores_str)
-    # except Exception as e:
-    #     logger.error(f"Filter failed: {e}")
-    #     filtered_sents_list, filtered_scores_list = [], []
+    try:
+        filtered_sents_list, filtered_scores_list, _ = filter_judge.judge_sentence(raw_sents_str, raw_scores_str)
+    except Exception as e:
+        logger.error(f"Filter failed: {e}")
+        filtered_sents_list, filtered_scores_list = [], []
         
-    # filtered_sents_str = format_list_custom(filtered_sents_list)
-    # filtered_scores_str = format_list_custom(filtered_scores_list)
+    filtered_sents_str = format_list_custom(filtered_sents_list)
+    filtered_scores_str = format_list_custom(filtered_scores_list)
 
-    filtered_sents_str, filtered_scores_str = [], []
+    # Context 格式化：使用 ||| 分隔不同句子的 context，避免混淆
+    def format_context_list(items):
+        # 将列表转为字符串，内部不含换行，外部用特定分隔符
+        # 这里用 ||| 分隔每个句子的 context
+        return "||||||||||||\n\n\n\n\n".join([str(item).replace("[", "(").replace("]", ")") for item in items])
+    
+    raw_contexts_str = format_context_list(collected_contexts)
+
     return (full_process_log, 
-            raw_scores_str, raw_sents_str, 
+            raw_scores_str, raw_sents_str, raw_contexts_str,
             filtered_scores_str, filtered_sents_str)
 
 
@@ -1006,6 +1075,7 @@ if __name__ == "__main__":
             "Full_Process", 
             "Think_RIND_Scores", 
             "Think_Sentences",
+            "Think_Contexts",
             "Filtered_Think_Scores",   
             "Filtered_Think_Sentences" 
         ])
@@ -1017,7 +1087,7 @@ if __name__ == "__main__":
     for i, question in enumerate(tqdm(questions)):
         try:
             # === 使用 DRAGIN 流程 ===
-            full_ctx, raw_scores, raw_sents, filt_scores, filt_sents = process_single_question_dragin(
+            full_ctx, raw_scores, raw_sents, raw_ctxs, filt_scores, filt_sents = process_single_question_dragin(
                 question, model, tokenizer, rind_calculator, 
                 device, filter_judge
             )
@@ -1026,6 +1096,7 @@ if __name__ == "__main__":
                 "Full_Process": full_ctx,
                 "Think_RIND_Scores": raw_scores,
                 "Think_Sentences": raw_sents,
+                "Think_Contexts": raw_ctxs,
                 "Filtered_Think_Scores": filt_scores,     
                 "Filtered_Think_Sentences": filt_sents    
             })

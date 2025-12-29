@@ -14,7 +14,7 @@ run_DRAGIN.py \
 ### selfRAG
 
 bash run_selfRAG.sh \
-生成样例：truthfulqa_selfrag_results.jsonl halueval_selfrag_results.jsonl \
+生成样例：selfrag_results/truthfulqa_selfrag_results.jsonl selfrag_results/halueval_selfrag_results.jsonl \
 由于模型训练的原因，需要自行进行答案匹配：默认最后一句作为conclusive answer来做 EM
 
 ### ETC
@@ -24,3 +24,4 @@ bash run_etc.sh \
 生成样例：etc_resuls/halueval_etc_results.jsonl and truthfulqa_etc_results.jsonl \
 最终答案从<answer></answer>标签中提取 \
 注： 对于halueval数据集将max_length设置为128已经足够； 对于truthfulqa则需要设置稍微长一些，如512
+

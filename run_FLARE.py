@@ -15,7 +15,7 @@ import os
 import pandas as pd
 from tqdm import tqdm
 from openai import OpenAI
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2,3"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -637,7 +637,7 @@ def get_next_sentence_with_scores(model, tokenizer, input_ids, device, max_new_t
         return_dict_in_generate=True,
         output_scores=True
     )
-    # 截取新生成的部分
+    # 截取新生成的部分  
     gen_seq = outputs.sequences[0][input_ids.shape[1]:]
     return gen_seq, outputs.scores
 
@@ -704,13 +704,15 @@ Answer: Krishna Shah has a child named Rudra Shah. Rudra Shah has a child named 
 # ==========================================
 # 带 Masking 的 FLARE  即论文中的implicit
 # ==========================================
+# ==========================================
+# 带 Masking 的 FLARE  即论文中的implicit
+# ==========================================
 def process_single_question_flare(question, model, tokenizer, rind_calculator, device, filter_judge):
-    # --- 参数设置 (参考论文附录) ---
-    # TruthfulQA/HaluEval 属于复杂 QA，建议参考 2WikiMultihopQA 的设置
-    THETA = 0.8  # Active Retrieval Threshold: 低于此概率触发检索
-    BETA = 0.4   # Masking Threshold: 低于此概率的词在构造 Query 时被过滤
+    # --- 参数设置 ---
+    THETA = 0.8  # Active Retrieval Threshold
+    BETA = 0.4   # Masking Threshold
+    
     # 1. 构造 Prompt
-    # 严格使用你提供的 Exemplars
     final_input_text = f"""Answer the given question. First provide your reasoning. Then provide the final direct answer enclosed inside <answer> and </answer>, without detailed illustrations. After providing the final answer, end your response and do not output anything else.\n{HOTPOT_QA_EXEMPLARS}\nQuestion: {question}\nAnswer:"""
 
     if tokenizer.chat_template:
@@ -718,100 +720,161 @@ def process_single_question_flare(question, model, tokenizer, rind_calculator, d
         input_text = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
     else:
         input_text = final_input_text
+        
     input_ids = tokenizer.encode(input_text, return_tensors='pt').to(device)
     full_process_text = input_text
+    
+    # 结果容器
     collected_sentences = []
     collected_scores = []
+    collected_contexts = [] # 【新增】收集 Context
+    
     max_sentences = 20          
     sentence_count = 0
 
     while sentence_count < max_sentences:
+        # 每一轮开始，默认 Context 为空
+        current_step_context = "No external context used."
+
         # [Step 1] Generate temporary next sentence (s_hat_t)
         temp_ids, temp_scores = get_next_sentence_with_scores(model, tokenizer, input_ids, device)
         if len(temp_ids) == 0:
             break 
         temp_text = tokenizer.decode(temp_ids, skip_special_tokens=True)
+        
         # [Step 2] Check confidence & Prepare Masked Query
         is_low_conf = False
         query_tokens = []
-        # 遍历生成的每个 token 及其 score
+        
         for i, t_id in enumerate(temp_ids):
-            # 获取当前 step 的 logit -> prob
-            # temp_scores 是 tuple(tensor(batch, vocab)), 取 [i][0]
+            # temp_scores 是 tuple(tensor(batch, vocab))
             step_prob = torch.softmax(temp_scores[i][0], dim=-1)[t_id].item()
-            # 判断是否触发检索 (Threshold Theta)
             if step_prob < THETA:
                 is_low_conf = True
-            # 构造 Query (Masking Threshold Beta)
-            # 只有置信度 > Beta 的词才保留，否则跳过（相当于 Mask 掉）
-            # 另外要保留标点符号以免破坏语义结构太严重（可选）
             if step_prob > BETA:
                 query_tokens.append(t_id)
+        
         final_ids = temp_ids
         final_scores = temp_scores
-        final_text = temp_text
+        # final_text = temp_text # 后面会重新 decode
+        
         # [Step 3] Active Retrieval
-        # 只有当 (1) 存在低置信度 token (2) 句子不是空的 (3) Mask 后的 Query 不为空
         if is_low_conf and len(temp_text.strip()) > 2:
-            # 解码 Mask 后的 Query
             masked_query = tokenizer.decode(query_tokens, skip_special_tokens=True).strip()
-            # 如果 Mask 完剩不下什么东西了，就还是用原句或者不搜
             search_query = masked_query if len(masked_query) > 3 else temp_text.strip()
+            
             # 执行检索
             retrieved_docs = search_flare(search_query)
+            
             if retrieved_docs:
                 # [Step 4] Regenerate
-                # 构造 Prompt: [Background Info] + [Input Context]
-                # 论文逻辑：检索内容作为临时前缀辅助生成当前句
-                # doc_prefix = f"Background Information:\n{retrieved_docs}\n\n"
+                # 【关键】如果触发检索，更新当前步的 Context
+                current_step_context = f"[FLARE Query: {search_query}] {retrieved_docs.replace(chr(10), ' ').strip()}"
+                
                 doc_prefix = retrieved_docs
-                # 记录每轮检索的内容和重新生成的内容 取消注释来进行记录
-                # full_process_text += f"\n[FLARE Triggered]\n[Draft]: {temp_text}\n[Masked Query]: {search_query}\n[Docs]: {retrieved_docs}.\n"
                 doc_ids = tokenizer.encode(doc_prefix, return_tensors='pt').to(device)
                 input_with_docs = torch.cat([doc_ids, input_ids], dim=1)
+                
                 # 重新生成
                 regen_ids, regen_scores = get_next_sentence_with_scores(model, tokenizer, input_with_docs, device)
                 final_ids = regen_ids
                 final_scores = regen_scores
-                final_text = tokenizer.decode(final_ids, skip_special_tokens=True)
                 # print(f"Regenerated") 
 
-        # [Step 5] Update Context
-        # 注意：使用 dim=1 进行拼接
+        # [Step 5] Update Context (For Next Loop)
         input_ids = torch.cat([input_ids, final_ids.unsqueeze(0)], dim=1)
-        # print("final_text:", final_text)
-        full_process_text += final_text
-        # --- RIND 计算 ---
+        
+        # 更新全流程文本 (简单追加，用于记录)
+        chunk_text_raw = tokenizer.decode(final_ids, skip_special_tokens=True)
+        full_process_text += chunk_text_raw
+        
+        # --- RIND 计算 & 句子切分 (使用 Dragin 同款逻辑) ---
         class MiniOut:
             def __init__(self, scores): self.scores = tuple(scores)
         mini_out = MiniOut(final_scores)
+        
         try:
+            # 1. 计算当前生成的 RIND
             rind_list = rind_calculator.compute_rind_for_generation(mini_out, final_ids, solver='max')
-            M = max((r for _, r, *_ in rind_list), default=0.0)
-            collected_sentences.append(final_text.strip()) # 收集的是重新生成的句子
-            collected_scores.append(round(M, 4)) # 收集的是重新生成句子的 RIND 分数
+            
+            # 2. 准备数据用于对齐
+            # 使用 decode 还原完美的文本用于 Spacy
+            chunk_text_proper = tokenizer.decode(final_ids, skip_special_tokens=True)
+            # 提取 scores 列表
+            chunk_scores_list = [(w, s) for w, s, _, _, _, _ in rind_list]
+            
+            # 3. Spacy 分句
+            doc = rind_calculator.nlp(chunk_text_proper)
+            
+            # 4. 对齐分数
+            score_cursor = 0
+            for span in doc.sents:
+                sent_text = span.text.strip()
+                if not sent_text:
+                    continue
+                
+                # 计算句子纯字符长度
+                sent_pure_len = len(sent_text.replace(" ", "").replace("\n", ""))
+                current_sent_scores = []
+                acc_len = 0
+                temp_cursor = score_cursor
+                
+                while temp_cursor < len(chunk_scores_list):
+                    w, s = chunk_scores_list[temp_cursor]
+                    w_clean = w.replace(rind_calculator.space_token, "").replace(" ", "").replace("\n", "")
+                    
+                    current_sent_scores.append(s)
+                    acc_len += len(w_clean)
+                    temp_cursor += 1
+                    
+                    if acc_len >= sent_pure_len:
+                        break
+                
+                score_cursor = temp_cursor
+                
+                # 获取最大分
+                max_s = max(current_sent_scores) if current_sent_scores else 0.0
+                
+                # 5. 存入结果 (Sentence, Score, Context)
+                collected_sentences.append(sent_text)
+                collected_scores.append(round(max_s, 4))
+                # 这一轮生成的所有句子都共享同一个 Context (因为是同一轮 generate 出来的)
+                collected_contexts.append(current_step_context)
+
         except Exception as e:
-            logger.warning(f"RIND calc failed: {e}")
-            collected_sentences.append(final_text.strip())
+            logger.warning(f"RIND/Split calc failed: {e}")
+            # Fallback
+            collected_sentences.append(chunk_text_raw.strip())
             collected_scores.append(0.0)
+            collected_contexts.append(current_step_context)
+            
         sentence_count += 1
+        
         # 检查是否结束 (EOS)
         if tokenizer.eos_token_id in final_ids:
             break
+            
     # [Filter 逻辑]
     raw_sents_str = format_list_custom(collected_sentences)
     raw_scores_str = format_list_custom(collected_scores)
-    # 这里需要实现启动过滤API 如果连接不到服务，会捕获异常并返回空列表
-    # try:
-    #     filtered_sents_list, filtered_scores_list, _ = filter_judge.judge_sentence(raw_sents_str, raw_scores_str)
-    # except Exception as e:
-    #     logger.error(f"Filter failed: {e}")
-    #     filtered_sents_list, filtered_scores_list = [], []
-    # filtered_sents_str = format_list_custom(filtered_sents_list)
-    # filtered_scores_str = format_list_custom(filtered_scores_list)
-    filtered_sents_str, filtered_scores_str = None, None
+   
+    try:
+        filtered_sents_list, filtered_scores_list, _ = filter_judge.judge_sentence(raw_sents_str, raw_scores_str)
+    except Exception as e:
+        logger.error(f"Filter failed: {e}")
+        filtered_sents_list, filtered_scores_list = [], []
+        
+    filtered_sents_str = format_list_custom(filtered_sents_list)
+    filtered_scores_str = format_list_custom(filtered_scores_list)
+    
+    # Context 格式化
+    def format_context_list(items):
+        return "||||||||||||\n\n\n\n\n".join([str(item).replace("[", "(").replace("]", ")") for item in items])
+    
+    raw_contexts_str = format_context_list(collected_contexts)
+
     return (full_process_text, 
-            raw_scores_str, raw_sents_str, 
+            raw_scores_str, raw_sents_str, raw_contexts_str, # 新增 context
             filtered_scores_str, filtered_sents_str)
 
 
@@ -880,6 +943,7 @@ if __name__ == "__main__":
             "Full_Process", 
             "Think_RIND_Scores", 
             "Think_Sentences",
+            "Think_Contexts",
             "Filtered_Think_Scores",   
             "Filtered_Think_Sentences" 
         ])
@@ -891,7 +955,7 @@ if __name__ == "__main__":
     for i, question in enumerate(tqdm(questions)):
         try:
             # === 使用 FLARE 流程 ===
-            full_ctx, raw_scores, raw_sents, filt_scores, filt_sents = process_single_question_flare(
+            full_ctx, raw_scores, raw_sents, raw_contexts, filt_scores, filt_sents = process_single_question_flare(
                 question, model, tokenizer, rind_calculator, 
                 device, filter_judge
             )
@@ -900,6 +964,7 @@ if __name__ == "__main__":
                 "Full_Process": full_ctx,
                 "Think_RIND_Scores": raw_scores,
                 "Think_Sentences": raw_sents,
+                "Think_Contexts": raw_contexts,
                 "Filtered_Think_Scores": filt_scores,     
                 "Filtered_Think_Sentences": filt_sents    
             })

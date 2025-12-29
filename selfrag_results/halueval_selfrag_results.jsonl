@@ -1,0 +1,5 @@
+{"question": "Which magazine was started first Arthur's Magazine or First for Women?", "response": "[Relevant]Arthur's Magazine was started in 1852, while First for Women was started in 1991.[No support / Contradictory][Utility:5]"}
+{"question": "The Oberoi family is part of a hotel company that has a head office in what city?", "response": "[Relevant]The Oberoi family is part of a hotel company that has a head office in New Delhi, India.[No support / Contradictory][Utility:5]"}
+{"question": "Musician and satirist Allie Goertz wrote a song about the \"The Simpsons\" character Milhouse, who Matt Groening named after who?", "response": "[Relevant]Matt Groening[Fully supported][Utility:5]"}
+{"question": " What nationality was James Henry Miller's wife?", "response": "[Irrelevant]English[Utility:5]"}
+{"question": "Cadmium Chloride is slightly soluble in this chemical, it is also called what?", "response": "[Relevant]alcohol.[Fully supported][Utility:5]"}
