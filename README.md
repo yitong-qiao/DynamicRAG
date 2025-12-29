@@ -25,3 +25,22 @@ bash run_etc.sh \
 最终答案从<answer></answer>标签中提取 \
 注： 对于halueval数据集将max_length设置为128已经足够； 对于truthfulqa则需要设置稍微长一些，如512
 
+### Skywork-o1
+
+bash run_skywork.sh\
+可以设置 batch size 来提升速度 \
+可能需要调整一下max_tokens来适应显存 \
+生成样例：skywork_results/halueval_skywork_results.jsonl and skywork_results/truthfulqa_skywork_results.jsonl \
+因为模型训练格式，有些答案会被包裹在boxed中，而大多数都是最后一句的Final Answer之后；因此可以使用默认最后一句作为conclusive answer来做 EM，可以查看当前的生成样例 \
+Skywork/Skywork-o1-Open-Llama-3.1-8B \
+https://huggingface.co/Skywork/Skywork-o1-Open-Llama-3.1-8B \
+
+### Marco-o1
+
+bash run_marcoo1.sh\ 
+可以设置 batch size 来提升速度 \
+可能需要调整一下max_tokens来适应显存 \
+生成样例：marcoo1_results/halueval_marcoo1_results.jsonl and marcoo1_results/truthfulqa_marcoo1_results.jsonl \
+AIDC-AI/Marco-o1 \
+https://huggingface.co/AIDC-AI/Marco-o1 \
+最终答案从<answer></answer>标签中提取； 但是某些情况模型可能多输出一些answer标签，建议还是提取</Thought>后方的内容（基本都是最后一句来做EM） \
