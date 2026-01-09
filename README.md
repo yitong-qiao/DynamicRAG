@@ -1,3 +1,45 @@
+### Direct Inference
+
+没有few-shot / CoT 推理样例 直接进行问答 \
+Answer the following question by reasoning step-by-step, following the example above. First provide your reasoning. Then provide the final direct answer enclosed inside <answer> and </answer>. After providing the final answer, end your response.\nQuestion: {q}\nAnswer: \
+bash run_Direct_inference.sh \
+生成样例：Direct_results/truthfulqa_Direct_results.jsonl and Direct_results/halueval_Direct_results.jsonl \
+最终答案从<answer></answer>标签中提取 \
+
+
+### CoT Inference
+
+添加了一些few-shot / CoT 推理样例 进行问答 \
+example: Question: Jeremy Theobald and Christopher Nolan share what profession?  
+Answer: Jeremy Theobald is an actor and producer. Christopher Nolan is a director, producer, and screenwriter. Therefore, they both share the profession of being a producer. So the answer is <answer> producer </answer>.  \
+bash run_CoT_inference.sh \
+生成样例：CoT_results/truthfulqa_CoT_results.jsonl and CoT_results/halueval_CoT_results.jsonl \
+最终答案从<answer></answer>标签中提取 \
+
+
+### DirectRAG Inference
+
+在Direct Inference的基础上结合RAG context进行QA \
+bash run_DirectRAG_inference.sh \
+生成样例：DirectRAG_results/truthfulqa_DirectRAG_results.jsonl and DirectRAG_results/halueval_DirectRAG_results.jsonl \
+最终答案从<answer></answer>标签中提取 \
+
+### CoTRAG Inference
+
+在CoT Inference的基础上结合RAG context进行QA \
+bash run_CoTRAG_inference.sh \
+生成样例：CoTRAG_results/truthfulqa_CoTRAG_results.jsonl and CoTRAG_results/halueval_CoTRAG_results.jsonl \
+最终答案从<answer></answer>标签中提取 \
+
+### IRCoT
+
+原仓库代码: https://github.com/stonybrooknlp/ircot \
+bash run_IRCoT.sh \
+生成样例：IRCoT_results/truthfulqa_IRCoT_results.jsonl and IRCoT_results/halueval_IRCoT_results.jsonl \
+最终答案从<answer></answer>标签中提取 \
+
+
+
 ### FLARE
 
 run_FLARE.py \
@@ -44,3 +86,4 @@ bash run_marcoo1.sh\
 AIDC-AI/Marco-o1 \
 https://huggingface.co/AIDC-AI/Marco-o1 \
 最终答案从<answer></answer>标签中提取； 但是某些情况模型可能多输出一些answer标签，建议还是提取</Thought>后方的内容（基本都是最后一句来做EM） \
+
